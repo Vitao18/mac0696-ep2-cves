@@ -1,0 +1,13 @@
+# Provas de RCE geradas em runtime (não versionar)
+mcp-inspector-cve-2025-49596/evidence/*
+!mcp-inspector-cve-2025-49596/evidence/.gitkeep
+
+# Artefatos de build / dependências
+node_modules/
+target/
+*.class
+.jbang/
+
+# Sistema
+.DS_Store
+*.log
